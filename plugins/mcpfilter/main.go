@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
@@ -16,12 +17,12 @@ import (
 const PluginName = "mcpfilter"
 
 type FilterConfig struct {
-	Enabled      bool   `json:"enabled"`
-	SystemPrompt string `json:"system_prompt"`
-	TimeoutSecs  int    `json:"timeout_seconds,omitempty"`
+	SystemPrompt string `json:"system"`
+	TimeoutSecs  int    `json:"timeout,omitempty"`
 }
 
 var (
+	configMu      sync.RWMutex
 	currentConfig FilterConfig
 	httpClient    *http.Client
 )
@@ -53,149 +54,256 @@ func Init(config any) error {
 		return nil
 	}
 
-	currentConfig = FilterConfig{
+	newConfig := FilterConfig{
 		TimeoutSecs: 10,
 	}
-	currentConfig.Enabled, _ = cfg["enabled"].(bool)
-	currentConfig.SystemPrompt, _ = cfg["system_prompt"].(string)
+	newConfig.SystemPrompt, _ = cfg["system_prompt"].(string)
 	if v, ok := cfg["timeout_seconds"].(float64); ok {
-		currentConfig.TimeoutSecs = int(v)
+		newConfig.TimeoutSecs = int(v)
 	}
 
-	httpClient = &http.Client{
-		Timeout: time.Duration(currentConfig.TimeoutSecs) * time.Second,
+	newHTTPClient := &http.Client{
+		Timeout: time.Duration(newConfig.TimeoutSecs) * time.Second,
 	}
+
+	configMu.Lock()
+	currentConfig = newConfig
+	httpClient = newHTTPClient
+	configMu.Unlock()
+
 	return nil
 }
 
 func GetName() string { return PluginName }
 func Cleanup() error  { return nil }
 
+// PreRequestHook is called once per top-level request.
+// It enriches the user's last message by sub-querying the LLM with a custom system prompt.
+// Mutations commit to req and are observed by all subsequent plugins, the provider call,
+// and every fallback attempt.
+func PreRequestHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) error {
+	// 1. Read config (thread-safe)
+	configMu.RLock()
+	cfg := currentConfig
+	client := httpClient
+	configMu.RUnlock()
+
+	// 2. Check if system prompt is set
+	if cfg.SystemPrompt == "" {
+		return nil
+	}
+
+	// 3. Check if chat request exists
+	if req.ChatRequest == nil || len(req.ChatRequest.Input) == 0 {
+		return nil
+	}
+
+	// 4. Save original input for fallback on error
+	originalInput := make([]schemas.ChatMessage, len(req.ChatRequest.Input))
+	copy(originalInput, req.ChatRequest.Input)
+
+	// 5. Remove ALL empty messages (any role, any position)
+	filtered := removeEmptyMessages(req.ChatRequest.Input)
+	if len(filtered) == 0 {
+		return nil
+	}
+
+	// 6. Last message must be from user
+	lastMsg := filtered[len(filtered)-1]
+	if lastMsg.Role != schemas.ChatMessageRoleUser {
+		return nil
+	}
+
+	// Extract user text
+	userText := extractMessageContent(&lastMsg)
+	if userText == "" {
+		return nil
+	}
+
+	// 7. Build context_mcpfilter for sub-request
+	// - First message: system prompt from config
+	// - Rest: all non-system messages from filtered context
+	contextMCP := buildContextMCP(filtered, cfg.SystemPrompt)
+
+	// 8. Sub-request to LLM with timeout
+	enhanced := enhanceWithTimeout(ctx, contextMCP, req.ChatRequest.Model, req.ChatRequest.Provider, client, cfg.TimeoutSecs)
+	if enhanced == "" {
+		// On error/timeout: restore original input (mcpfilter did nothing)
+		req.ChatRequest.Input = originalInput
+		return nil
+	}
+
+	// 9. Append assistant message with LLM's response (unmodified)
+	assistantMsg := schemas.ChatMessage{
+		Role:    schemas.ChatMessageRoleAssistant,
+		Content: &schemas.ChatMessageContent{ContentStr: &enhanced},
+	}
+	req.ChatRequest.Input = append(req.ChatRequest.Input, assistantMsg)
+
+	return nil
+}
+
+// PreLLMHook is not used by mcpfilter (we use PreRequestHook instead)
 func PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) (
 	*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error,
 ) {
-	if !currentConfig.Enabled || currentConfig.SystemPrompt == "" {
-		return req, nil, nil
-	}
-	if req.ChatRequest == nil || len(req.ChatRequest.Input) == 0 {
-		return req, nil, nil
-	}
-
-	// Remove trailing empty messages
-	for len(req.ChatRequest.Input) > 0 {
-		last := req.ChatRequest.Input[len(req.ChatRequest.Input)-1]
-		if last.Content == nil || last.Content.ContentStr == nil || *last.Content.ContentStr == "" {
-			req.ChatRequest.Input = req.ChatRequest.Input[:len(req.ChatRequest.Input)-1]
-		} else {
-			break
-		}
-	}
-	if len(req.ChatRequest.Input) == 0 {
-		return req, nil, nil
-	}
-
-	// Last message must be from user
-	lastMsg := req.ChatRequest.Input[len(req.ChatRequest.Input)-1]
-	if lastMsg.Role != schemas.ChatMessageRoleUser {
-		return req, nil, nil
-	}
-	userText := *lastMsg.Content.ContentStr
-
-	enhanced := enhance(ctx, userText, req.ChatRequest)
-	if enhanced == "" {
-		return req, nil, nil
-	}
-
-	// Set system message: update existing or prepend new
-	found := false
-	for i := range req.ChatRequest.Input {
-		if req.ChatRequest.Input[i].Role == schemas.ChatMessageRoleSystem {
-			if req.ChatRequest.Input[i].Content == nil {
-				req.ChatRequest.Input[i].Content = &schemas.ChatMessageContent{}
-			}
-			req.ChatRequest.Input[i].Content.ContentStr = &enhanced
-			found = true
-			break
-		}
-	}
-	if !found {
-		sysMsg := schemas.ChatMessage{
-			Role:    schemas.ChatMessageRoleSystem,
-			Content: &schemas.ChatMessageContent{ContentStr: &enhanced},
-		}
-		req.ChatRequest.Input = append([]schemas.ChatMessage{sysMsg}, req.ChatRequest.Input...)
-	}
-
 	return req, nil, nil
 }
 
-func PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, err *schemas.BifrostError) (
+// PostLLMHook is not used by mcpfilter
+func PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bifrostErr *schemas.BifrostError) (
 	*schemas.BifrostResponse, *schemas.BifrostError, error,
 ) {
-	return resp, err, nil
+	return resp, bifrostErr, nil
 }
 
-func enhance(ctx *schemas.BifrostContext, userMsg string, req *schemas.BifrostChatRequest) string {
-	model := req.Model
+// removeEmptyMessages removes all messages with empty content (any role)
+func removeEmptyMessages(messages []schemas.ChatMessage) []schemas.ChatMessage {
+	result := make([]schemas.ChatMessage, 0, len(messages))
+	for _, msg := range messages {
+		if !isEmptyMessage(&msg) {
+			result = append(result, msg)
+		}
+	}
+	return result
+}
 
-	// Get provider config from Bifrost context
-	provider := req.Provider
+// isEmptyMessage checks if a message has empty content
+func isEmptyMessage(msg *schemas.ChatMessage) bool {
+	if msg.Content == nil {
+		return true
+	}
+	if msg.Content.ContentStr != nil && *msg.Content.ContentStr == "" {
+		return true
+	}
+	// If ContentBlocks is present, message is not empty
+	if len(msg.Content.ContentBlocks) > 0 {
+		return false
+	}
+	return true
+}
 
+// extractMessageContent extracts text content from a message
+func extractMessageContent(msg *schemas.ChatMessage) string {
+	if msg.Content == nil {
+		return ""
+	}
+	if msg.Content.ContentStr != nil {
+		return *msg.Content.ContentStr
+	}
+	// For ContentBlocks, we'd need to serialize - for now return empty
+	// This can be enhanced if needed
+	return ""
+}
+
+// buildContextMCP builds the context for the sub-request
+// - First message: system prompt from config
+// - Rest: all non-system messages from the filtered context
+func buildContextMCP(filtered []schemas.ChatMessage, systemPrompt string) []chatMessage {
+	result := make([]chatMessage, 0, len(filtered)+1)
+
+	// First message: system prompt
+	result = append(result, chatMessage{
+		Role:    "system",
+		Content: systemPrompt,
+	})
+
+	// Rest: non-system messages
+	for _, msg := range filtered {
+		if msg.Role == schemas.ChatMessageRoleSystem {
+			continue // skip original system messages
+		}
+
+		content := extractMessageContent(&msg)
+		result = append(result, chatMessage{
+			Role:    string(msg.Role),
+			Content: content,
+		})
+	}
+
+	return result
+}
+
+// enhanceWithTimeout sends a sub-request to LLM with timeout handling
+func enhanceWithTimeout(
+	ctx *schemas.BifrostContext,
+	messages []chatMessage,
+	model string,
+	provider schemas.ModelProvider,
+	client *http.Client,
+	timeoutSecs int,
+) string {
+	// Create request body
 	body, err := json.Marshal(chatRequest{
-		Model: model,
-		Messages: []chatMessage{
-			{Role: "system", Content: currentConfig.SystemPrompt},
-			{Role: "user", Content: userMsg},
-		},
+		Model:       model,
+		Messages:    messages,
 		MaxTokens:   1024,
 		Temperature: 0.3,
 	})
 	if err != nil {
+		ctx.Log(schemas.LogLevelError, fmt.Sprintf("MCPFilter: failed to marshal request: %v", err))
 		return ""
 	}
 
 	// Use Bifrost's built-in provider URL construction
+	// provider is passed as parameter from req.ChatRequest.Provider
 	baseURL := getProviderBaseURL(provider)
-
 	url := strings.TrimRight(baseURL, "/") + "/chat/completions"
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	// Create HTTP request with context timeout
+	httpCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(httpCtx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
+		ctx.Log(schemas.LogLevelError, fmt.Sprintf("MCPFilter: failed to create request: %v", err))
 		return ""
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	// Get API key from Bifrost context
 	apiKey := getProviderAPIKey(ctx, provider)
-
 	if apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
-	resp, err := httpClient.Do(httpReq)
+	// Execute request
+	resp, err := client.Do(httpReq)
 	if err != nil {
-		if ctx.Err() == context.Canceled {
+		if httpCtx.Err() == context.Canceled {
 			ctx.Log(schemas.LogLevelInfo, "MCPFilter: client disconnected, skipping enhancement")
+		} else {
+			ctx.Log(schemas.LogLevelError, fmt.Sprintf("MCPFilter: request error: %v", err))
 		}
 		return ""
 	}
 	defer resp.Body.Close()
 
+	// Check status code
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		ctx.Log(schemas.LogLevelError, fmt.Sprintf("MCPFilter: status %d: %s", resp.StatusCode, string(b)))
 		return ""
 	}
 
+	// Parse response
 	var result chatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		ctx.Log(schemas.LogLevelError, fmt.Sprintf("MCPFilter: failed to decode response: %v", err))
 		return ""
 	}
 	if len(result.Choices) == 0 {
+		ctx.Log(schemas.LogLevelWarn, "MCPFilter: no choices in response")
 		return ""
 	}
 
-	return strings.TrimSpace(result.Choices[0].Message.Content)
+	content := strings.TrimSpace(result.Choices[0].Message.Content)
+	if content == "" {
+		ctx.Log(schemas.LogLevelWarn, "MCPFilter: empty content in response")
+		return ""
+	}
+
+	return content
 }
 
 // getProviderBaseURL returns the base URL for the given provider
@@ -217,7 +325,9 @@ func getProviderBaseURL(provider schemas.ModelProvider) string {
 }
 
 // getProviderAPIKey returns the API key for the given provider from context
-// For now, returns empty string - plugin will use environment variables or default auth
 func getProviderAPIKey(ctx *schemas.BifrostContext, provider schemas.ModelProvider) string {
+	// For now, returns empty string - plugin will use environment variables or default auth
+	// In production, extract from headers or Bifrost's secret store
+	// Example: ctx.Value("api_key") or from req headers
 	return ""
 }
