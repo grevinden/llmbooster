@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
@@ -16,53 +15,31 @@ import (
 
 const PluginName = "mcpfilter"
 
-// ─── Configuration ──────────────────────────────────────────────────────────
-
 type FilterConfig struct {
-	Enabled         bool     `json:"enabled"`
-	SystemPrompt    string   `json:"system_prompt"`
-	ModelOverride   string   `json:"model_override,omitempty"`
-	MaxTokens       int      `json:"max_tokens,omitempty"`
-	RejectOnBlock   bool     `json:"reject_on_block"`
-	FailOpen        bool     `json:"fail_open"`
-	TimeoutSeconds  int      `json:"timeout_seconds,omitempty"`
-	BlockKeywords   []string `json:"block_keywords,omitempty"`
-	ProviderBaseURL string   `json:"provider_base_url,omitempty"`
-	ProviderAPIKey  string   `json:"provider_api_key,omitempty"`
+	Enabled      bool   `json:"enabled"`
+	SystemPrompt string `json:"system_prompt"`
+	TimeoutSecs  int    `json:"timeout_seconds,omitempty"`
 }
-
-// ─── Package-level state (shared across all requests) ───────────────────────
 
 var (
 	currentConfig FilterConfig
 	httpClient    *http.Client
-	pluginMu      sync.RWMutex
-	pluginStats   FilterStats
 )
 
-type FilterStats struct {
-	TotalRequests   int64 `json:"total_requests"`
-	BlockedRequests int64 `json:"blocked_requests"`
-	PassedRequests  int64 `json:"passed_requests"`
-	AvgFilterTimeMs int64 `json:"avg_filter_time_ms"`
+type chatRequest struct {
+	Model       string        `json:"model"`
+	Messages    []chatMessage `json:"messages"`
+	MaxTokens   int           `json:"max_tokens,omitempty"`
+	Temperature float64       `json:"temperature"`
+	Stream      bool          `json:"stream"`
 }
 
-// ─── HTTP request/response types (for direct provider calls) ────────────────
-
-type filterChatRequest struct {
-	Model       string              `json:"model"`
-	Messages    []filterChatMessage `json:"messages"`
-	MaxTokens   int                 `json:"max_tokens,omitempty"`
-	Temperature float64             `json:"temperature"`
-	Stream      bool                `json:"stream"`
-}
-
-type filterChatMessage struct {
+type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-type filterChatResponse struct {
+type chatResponse struct {
 	Choices []struct {
 		Message struct {
 			Content string `json:"content"`
@@ -70,285 +47,177 @@ type filterChatResponse struct {
 	} `json:"choices"`
 }
 
-// ─── Plugin lifecycle (required symbols) ────────────────────────────────────
-
-// Init is called when the plugin is loaded.
 func Init(config any) error {
 	cfg, ok := config.(map[string]any)
 	if !ok {
 		return nil
 	}
 
-	pluginMu.Lock()
-	defer pluginMu.Unlock()
-
 	currentConfig = FilterConfig{
-		RejectOnBlock:   true,
-		FailOpen:        true,
-		TimeoutSeconds:  30,
-		ProviderBaseURL: "https://api.openai.com/v1",
+		TimeoutSecs: 10,
 	}
-
-	if v, ok := cfg["enabled"].(bool); ok {
-		currentConfig.Enabled = v
-	}
-	if v, ok := cfg["system_prompt"].(string); ok {
-		currentConfig.SystemPrompt = v
-	}
-	if v, ok := cfg["model_override"].(string); ok {
-		currentConfig.ModelOverride = v
-	}
-	if v, ok := cfg["max_tokens"].(float64); ok {
-		currentConfig.MaxTokens = int(v)
-	}
-	if v, ok := cfg["reject_on_block"].(bool); ok {
-		currentConfig.RejectOnBlock = v
-	}
-	if v, ok := cfg["fail_open"].(bool); ok {
-		currentConfig.FailOpen = v
-	}
+	currentConfig.Enabled, _ = cfg["enabled"].(bool)
+	currentConfig.SystemPrompt, _ = cfg["system_prompt"].(string)
 	if v, ok := cfg["timeout_seconds"].(float64); ok {
-		currentConfig.TimeoutSeconds = int(v)
-	}
-	if keywords, ok := cfg["block_keywords"].([]any); ok {
-		for _, k := range keywords {
-			if s, ok := k.(string); ok {
-				currentConfig.BlockKeywords = append(currentConfig.BlockKeywords, s)
-			}
-		}
-	}
-	if v, ok := cfg["provider_base_url"].(string); ok {
-		currentConfig.ProviderBaseURL = v
-	}
-	if v, ok := cfg["provider_api_key"].(string); ok {
-		currentConfig.ProviderAPIKey = v
+		currentConfig.TimeoutSecs = int(v)
 	}
 
 	httpClient = &http.Client{
-		Timeout: time.Duration(currentConfig.TimeoutSeconds) * time.Second,
+		Timeout: time.Duration(currentConfig.TimeoutSecs) * time.Second,
 	}
-
 	return nil
 }
 
-// GetName returns the plugin identifier (required).
 func GetName() string { return PluginName }
+func Cleanup() error  { return nil }
 
-// Cleanup is called when the plugin is unloaded (required).
-func Cleanup() error { return nil }
-
-// ─── LLM hooks ──────────────────────────────────────────────────────────────
-
-// PreLLMHook is called before the request is sent to the provider.
 func PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) (
 	*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error,
 ) {
-	pluginMu.RLock()
-	cfg := currentConfig
-	pluginMu.RUnlock()
-
-	if !cfg.Enabled {
+	if !currentConfig.Enabled || currentConfig.SystemPrompt == "" {
 		return req, nil, nil
 	}
-
-	pluginMu.Lock()
-	pluginStats.TotalRequests++
-	pluginMu.Unlock()
-
 	if req.ChatRequest == nil || len(req.ChatRequest.Input) == 0 {
 		return req, nil, nil
 	}
 
-	userMsg := extractUserMessage(req.ChatRequest.Input)
-	if userMsg == "" {
-		recordPass()
+	// Remove trailing empty messages
+	for len(req.ChatRequest.Input) > 0 {
+		last := req.ChatRequest.Input[len(req.ChatRequest.Input)-1]
+		if last.Content == nil || last.Content.ContentStr == nil || *last.Content.ContentStr == "" {
+			req.ChatRequest.Input = req.ChatRequest.Input[:len(req.ChatRequest.Input)-1]
+		} else {
+			break
+		}
+	}
+	if len(req.ChatRequest.Input) == 0 {
 		return req, nil, nil
 	}
 
-	if cfg.SystemPrompt == "" && len(cfg.BlockKeywords) == 0 {
-		recordPass()
+	// Last message must be from user
+	lastMsg := req.ChatRequest.Input[len(req.ChatRequest.Input)-1]
+	if lastMsg.Role != schemas.ChatMessageRoleUser {
+		return req, nil, nil
+	}
+	userText := *lastMsg.Content.ContentStr
+
+	enhanced := enhance(ctx, userText, req.ChatRequest)
+	if enhanced == "" {
 		return req, nil, nil
 	}
 
-	start := time.Now()
-	result := runFilter(ctx, cfg, userMsg, req.ChatRequest.Model)
-	elapsed := time.Since(start).Milliseconds()
-	updateStats(result.Blocked, elapsed)
-
-	if result.Blocked && cfg.RejectOnBlock {
-		statusCode := 400
-		errMsg := fmt.Sprintf("Request blocked by filter: %s", result.Reason)
-		return nil, &schemas.LLMPluginShortCircuit{
-			Error: &schemas.BifrostError{
-				IsBifrostError: true,
-				StatusCode:     &statusCode,
-				Error: &schemas.ErrorField{
-					Message: errMsg,
-				},
-			},
-		}, nil
+	// Set system message: update existing or prepend new
+	found := false
+	for i := range req.ChatRequest.Input {
+		if req.ChatRequest.Input[i].Role == schemas.ChatMessageRoleSystem {
+			if req.ChatRequest.Input[i].Content == nil {
+				req.ChatRequest.Input[i].Content = &schemas.ChatMessageContent{}
+			}
+			req.ChatRequest.Input[i].Content.ContentStr = &enhanced
+			found = true
+			break
+		}
+	}
+	if !found {
+		sysMsg := schemas.ChatMessage{
+			Role:    schemas.ChatMessageRoleSystem,
+			Content: &schemas.ChatMessageContent{ContentStr: &enhanced},
+		}
+		req.ChatRequest.Input = append([]schemas.ChatMessage{sysMsg}, req.ChatRequest.Input...)
 	}
 
 	return req, nil, nil
 }
 
-// PostLLMHook is called after the provider responds.
-func PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bifrostErr *schemas.BifrostError) (
+func PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, err *schemas.BifrostError) (
 	*schemas.BifrostResponse, *schemas.BifrostError, error,
 ) {
-	return resp, bifrostErr, nil
+	return resp, err, nil
 }
 
-// ─── Filtering logic ────────────────────────────────────────────────────────
+func enhance(ctx *schemas.BifrostContext, userMsg string, req *schemas.BifrostChatRequest) string {
+	model := req.Model
 
-type filterResult struct {
-	Blocked bool
-	Reason  string
-}
+	// Get provider config from Bifrost context
+	provider := req.Provider
 
-func runFilter(ctx *schemas.BifrostContext, cfg FilterConfig, userMessage string, reqModel string) filterResult {
-	// Fast path: keyword check
-	for _, kw := range cfg.BlockKeywords {
-		if strings.Contains(strings.ToLower(userMessage), strings.ToLower(kw)) {
-			return filterResult{
-				Blocked: true,
-				Reason:  fmt.Sprintf("blocked keyword: %s", kw),
-			}
-		}
-	}
-
-	// No LLM filter configured
-	if cfg.SystemPrompt == "" {
-		return filterResult{Blocked: false}
-	}
-
-	// Build filter request
-	filterModel := reqModel
-	if cfg.ModelOverride != "" {
-		filterModel = cfg.ModelOverride
-	}
-	maxTokens := cfg.MaxTokens
-	if maxTokens == 0 {
-		maxTokens = 100
-	}
-
-	body, err := json.Marshal(filterChatRequest{
-		Model: filterModel,
-		Messages: []filterChatMessage{
-			{Role: "system", Content: cfg.SystemPrompt},
-			{Role: "user", Content: userMessage},
+	body, err := json.Marshal(chatRequest{
+		Model: model,
+		Messages: []chatMessage{
+			{Role: "system", Content: currentConfig.SystemPrompt},
+			{Role: "user", Content: userMsg},
 		},
-		MaxTokens:   maxTokens,
-		Temperature: 0.0,
-		Stream:      false,
+		MaxTokens:   1024,
+		Temperature: 0.3,
 	})
 	if err != nil {
-		ctx.Log(schemas.LogLevelError, fmt.Sprintf("MCPFilter: marshal failed: %v", err))
-		return filterResult{Blocked: false}
+		return ""
 	}
 
-	url := strings.TrimRight(cfg.ProviderBaseURL, "/") + "/chat/completions"
+	// Use Bifrost's built-in provider URL construction
+	baseURL := getProviderBaseURL(provider)
 
-	// Use ctx as context.Context — BifrostContext implements it, so client
-	// disconnects cancel the filter call immediately.
+	url := strings.TrimRight(baseURL, "/") + "/chat/completions"
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		ctx.Log(schemas.LogLevelError, fmt.Sprintf("MCPFilter: NewRequest failed: %v", err))
-		return filterResult{Blocked: false}
+		return ""
 	}
-
 	httpReq.Header.Set("Content-Type", "application/json")
-	if cfg.ProviderAPIKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+cfg.ProviderAPIKey)
+
+	// Get API key from Bifrost context
+	apiKey := getProviderAPIKey(ctx, provider)
+
+	if apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		if ctx.Err() == context.Canceled {
-			ctx.Log(schemas.LogLevelInfo, "MCPFilter: client disconnected, aborting filter")
-			return filterResult{Blocked: false}
+			ctx.Log(schemas.LogLevelInfo, "MCPFilter: client disconnected, skipping enhancement")
 		}
-		ctx.Log(schemas.LogLevelError, fmt.Sprintf("MCPFilter: HTTP failed: %v", err))
-		if cfg.FailOpen {
-			return filterResult{Blocked: false}
-		}
-		return filterResult{Blocked: true, Reason: fmt.Sprintf("filter error: %v", err)}
+		return ""
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		ctx.Log(schemas.LogLevelError, fmt.Sprintf("MCPFilter: read body failed: %v", err))
-		if cfg.FailOpen {
-			return filterResult{Blocked: false}
-		}
-		return filterResult{Blocked: true, Reason: "filter read error"}
-	}
-
 	if resp.StatusCode != http.StatusOK {
-		ctx.Log(schemas.LogLevelError, fmt.Sprintf("MCPFilter: status %d: %s", resp.StatusCode, string(respBody)))
-		if cfg.FailOpen {
-			return filterResult{Blocked: false}
-		}
-		return filterResult{Blocked: true, Reason: fmt.Sprintf("provider error: status %d", resp.StatusCode)}
+		b, _ := io.ReadAll(resp.Body)
+		ctx.Log(schemas.LogLevelError, fmt.Sprintf("MCPFilter: status %d: %s", resp.StatusCode, string(b)))
+		return ""
 	}
 
-	var filterResp filterChatResponse
-	if err := json.Unmarshal(respBody, &filterResp); err != nil {
-		ctx.Log(schemas.LogLevelError, fmt.Sprintf("MCPFilter: unmarshal failed: %v", err))
-		if cfg.FailOpen {
-			return filterResult{Blocked: false}
-		}
-		return filterResult{Blocked: true, Reason: "filter parse error"}
+	var result chatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return ""
+	}
+	if len(result.Choices) == 0 {
+		return ""
 	}
 
-	if len(filterResp.Choices) == 0 {
-		return filterResult{Blocked: false}
-	}
-
-	response := strings.TrimSpace(strings.ToLower(filterResp.Choices[0].Message.Content))
-	if strings.Contains(response, "block") || strings.Contains(response, "reject") {
-		return filterResult{
-			Blocked: true,
-			Reason:  fmt.Sprintf("LLM filter blocked: %s", filterResp.Choices[0].Message.Content),
-		}
-	}
-
-	return filterResult{Blocked: false}
+	return strings.TrimSpace(result.Choices[0].Message.Content)
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-func extractUserMessage(messages []schemas.ChatMessage) string {
-	for _, msg := range messages {
-		if msg.Role == schemas.ChatMessageRoleUser {
-			if msg.Content != nil && msg.Content.ContentStr != nil {
-				return *msg.Content.ContentStr
-			}
-		}
+// getProviderBaseURL returns the base URL for the given provider
+func getProviderBaseURL(provider schemas.ModelProvider) string {
+	switch provider {
+	case schemas.OpenAI:
+		return "https://api.openai.com/v1"
+	case schemas.Anthropic:
+		return "https://api.anthropic.com/v1"
+	case schemas.Azure:
+		return "https://<resource-name>.openai.azure.com/openai/deployments"
+	case schemas.Gemini:
+		return "https://generativelanguage.googleapis.com/v1beta"
+	case schemas.Ollama:
+		return "http://localhost:11434/v1"
+	default:
+		return "https://api.openai.com/v1"
 	}
+}
+
+// getProviderAPIKey returns the API key for the given provider from context
+// For now, returns empty string - plugin will use environment variables or default auth
+func getProviderAPIKey(ctx *schemas.BifrostContext, provider schemas.ModelProvider) string {
 	return ""
-}
-
-func recordPass() {
-	pluginMu.Lock()
-	pluginStats.TotalRequests++
-	pluginStats.PassedRequests++
-	pluginMu.Unlock()
-}
-
-func updateStats(blocked bool, elapsedMs int64) {
-	pluginMu.Lock()
-	defer pluginMu.Unlock()
-
-	if blocked {
-		pluginStats.BlockedRequests++
-	} else {
-		pluginStats.PassedRequests++
-	}
-
-	total := pluginStats.TotalRequests
-	if total > 0 {
-		pluginStats.AvgFilterTimeMs = (pluginStats.AvgFilterTimeMs*(total-1) + elapsedMs) / total
-	}
 }

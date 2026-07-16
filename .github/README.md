@@ -1,110 +1,96 @@
 # llmbooster
 
-Bifrost plugin for pre-LLM request filtering. Replaces Plano AI with a pure OSS `.so` plugin that filters requests using the same LLM provider, leveraging prompt caching for fast repeated calls.
+Bifrost-плагин для улучшения запросов перед отправкой в LLM. Использует тот же провайдер и prompt caching для быстрой работы.
 
-## Architecture
+## Архитектура
 
 ```
-Client (Copilot SSE)
+Клиент (Copilot SSE)
   → Bifrost
     → mcpfilter PreLLMHook
-      ├─ Keyword check (<1ms)
-      └─ LLM filter call (same provider, prompt cache warm)
-           ├─ Context cancelled → abort immediately, 0 tokens spent
-           ├─ Block → LLMPluginShortCircuit{Error}
-           └─ Pass → continue to main LLM call
+      ├─ Улучшение через LLM (тот же провайдер, кэш тёплый)
+      │    ├─ Контекст отменён → отмена мгновенно, 0 токенов
+      │    ├─ Успел → заменяет сообщение на улучшенное
+      │    └─ Не успел / ошибка → оригинальный запрос без изменений
+      └─ → основной LLM-вызов
 ```
 
-The filter call goes directly to the LLM provider (not through Bifrost) via `http.NewRequestWithContext(ctx, ...)`. When the client disconnects, the `BifrostContext` is cancelled, aborting the filter HTTP request instantly.
+Запрос к улучшению идёт напрямую к провайдеру (не через Bifrost) через `http.NewRequestWithContext(ctx, ...)`. При отключении клиента `BifrostContext` отменяется, HTTP-запрос прерывается мгновенно.
 
-## Quick Start
+## Быстрый старт
 
 ```bash
-# Build the plugin
-cd plugins/mcpfilter
-go mod tidy
-go build -buildmode=plugin -o mcpfilter.so .
-
-# Load in Bifrost Web UI → Plugins → Add Plugin → path to mcpfilter.so
+make deps     # скачать зависимости
+make plugin   # собрать .so
+# Установить через Bifrost Web UI → Plugins → Add Plugin → путь к mcpfilter.so
 ```
 
-## Configuration
+## Конфигурация
 
 ```json
 {
   "enabled": true,
-  "system_prompt": "You are a content filter. Respond with BLOCK or PASS.",
+  "system_prompt": "Перефразируй запрос пользователя так, чтобы он был максимально понятным и точным для LLM. Сохрани намерение. Отвечай только улучшенным запросом без пояснений.",
   "model_override": "gpt-4o-mini",
-  "max_tokens": 100,
-  "reject_on_block": true,
-  "fail_open": true,
-  "timeout_seconds": 30,
-  "block_keywords": ["hack", "exploit"],
+  "timeout_seconds": 10,
   "provider_base_url": "https://api.openai.com/v1",
   "provider_api_key": "env.OPENAI_API_KEY"
 }
 ```
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | bool | `false` | Enable the filter |
-| `system_prompt` | string | `""` | LLM filter prompt (empty = keyword-only) |
-| `model_override` | string | `""` | Model for filter calls (uses request model if empty) |
-| `max_tokens` | int | `100` | Max tokens for filter response |
-| `reject_on_block` | bool | `true` | Return 400 error when blocked |
-| `fail_open` | bool | `true` | Allow request if filter fails |
-| `timeout_seconds` | int | `30` | Filter HTTP timeout |
-| `block_keywords` | []string | `[]` | Case-insensitive keyword blocklist |
-| `provider_base_url` | string | `https://api.openai.com/v1` | LLM API endpoint |
-| `provider_api_key` | string | `""` | API key |
+| Поле | Тип | По умолчанию | Описание |
+|------|-----|-------------|----------|
+| `enabled` | bool | `false` | Включить плагин |
+| `system_prompt` | string | `""` | Инструкция для LLM-улучшения |
+| `model_override` | string | `""` | Модель для улучшения (пусто = модель из запроса) |
+| `timeout_seconds` | int | `10` | Максимум времени на улучшение |
+| `provider_base_url` | string | `https://api.openai.com/v1` | URL API провайдера |
+| `provider_api_key` | string | `""` | API-ключ (`env.VAR` для переменных окружения) |
 
-## How It Works
+## Как это работает
 
-1. Request arrives at Bifrost
-2. `PreLLMHook` fires — keyword check runs first (<1ms)
-3. If `system_prompt` is set, sends a non-streaming filter call to the same provider
-4. First call warms the prompt cache; subsequent calls are 50-100ms (vs 200-500ms cold)
-5. If filter response contains "block" or "reject" → `LLMPluginShortCircuit` with 400 error
-6. If pass → request continues to the main LLM call
+1. Запрос приходит в Bifrost
+2. `PreLLMHook` извлекает последнее сообщение пользователя
+3. Отправляет его в LLM с `system_prompt` (улучшающая инструкция)
+4. Если ответил вовремя — заменяет сообщение на улучшенное
+5. Если таймаут или ошибка — запрос проходит как есть
 
-## Context Cancellation
+**Плагин никогда не блокирует запрос.** Он только улучшает.
 
-When a client disconnects (e.g., Copilot "Cancel"):
+## Отмена при отключении клиента
 
-1. `BifrostContext.Done()` fires
-2. `http.NewRequestWithContext` propagates the cancellation
-3. Filter HTTP call aborts immediately
-4. Plugin returns `filterResult{Blocked: false}` — no tokens spent
-5. Main LLM call never starts
+1. Клиент нажимает «Отмена» (Copilot)
+2. `BifrostContext.Done()` срабатывает
+3. `http.NewRequestWithContext` прерывает HTTP-запрос к улучшителю
+4. Плагин возвращает оригинальный запрос — токены не потрачены
+5. Основной LLM-вызов не начинается
 
-## Project Structure
+## Сборка
+
+Требуется Go 1.26.4 (как у Bifrost).
+
+```bash
+make plugin       # собрать для текущей архитектуры
+make plugin-docker # собрать через Docker (для NAS)
+make bifrost-dynamic # пересобрать Bifrost с поддержкой плагинов
+```
+
+## Структура проекта
 
 ```
 llmbooster/
-├── .github/README.md          # This file
+├── .github/README.md          # Этот файл
 ├── .gitmodules                # Bifrost submodule
 ├── lib/bifrost/               # Bifrost (git submodule)
 ├── plugins/mcpfilter/
-│   ├── main.go                # Plugin implementation
-│   ├── go.mod                 # Go module with replace directive
-│   └── README.md              # Plugin-specific docs
+│   ├── main.go                # Реализация плагина
+│   ├── go.mod                 # Go module
+│   └── README.md              # Документация плагина
 ├── .agents/skills/
 │   └── code-simplification/   # Agent skill
-└── talks/                     # Research notes
+└── talks/                     # Исследования
 ```
 
-## Development
-
-The plugin is a Go shared object (`.so`) loaded by Bifrost via `plugin.Open()`. It exports package-level functions:
-
-- `Init(config any) error` — parse config map
-- `GetName() string` — plugin identifier
-- `Cleanup() error` — cleanup on unload
-- `PreLLMHook(ctx, req) (req, shortCircuit, error)` — pre-filter
-- `PostLLMHook(ctx, resp, err) (resp, err, error)` — post-hook (passthrough)
-
-Build requires the same Go version as Bifrost (currently 1.26.4).
-
-## License
+## Лицензия
 
 MIT
