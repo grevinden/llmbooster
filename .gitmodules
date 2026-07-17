@@ -1,3 +1,0 @@
-[submodule "lib/bifrost"]
-	path = lib/bifrost
-	url = https://github.com/maximhq/bifrost
